@@ -5,7 +5,7 @@ import re
 import sys
 import traceback
 from pathlib import Path
-from typing import Optional, Sequence, Tuple
+from typing import Optional, Sequence, Tuple, Union
 
 import discord
 from discord import app_commands
@@ -70,12 +70,15 @@ MOD_ROLE_ID = optional_snowflake("MOD_ROLE_ID", "SUPPORT_ROLE_ID", "MODS_ROLE_ID
 ADMIN_ROLE_ID = optional_snowflake("ADMIN_ROLE_ID", "ADMINISTRATOR_ROLE_ID")
 MOD_ROLE_NAMES = ("mods", "mod")
 ADMIN_ROLE_NAMES = ("admin", "admins")
+HELP_EMOJI = "🆘"
 # =====================================================================
 
 # No privileged intents — avoids Discord PrivilegedIntentsRequired crash-loops
 # when Message Content / Server Members are disabled in the developer portal.
 intents = discord.Intents.default()
 intents.guilds = True
+intents.guild_messages = True
+intents.guild_reactions = True
 
 bot = commands.Bot(
     command_prefix="!",
@@ -88,6 +91,7 @@ bot = commands.Bot(
 guild_obj = discord.Object(id=GUILD_ID)
 
 DATA_FILE = Path("tickets.json")
+_creating_tickets: set[int] = set()
 
 
 def load_data():
@@ -97,10 +101,11 @@ def load_data():
                 data = json.load(f)
             data.setdefault("next_ticket", 1)
             data.setdefault("open_tickets", {})
+            data.setdefault("panel_message_ids", [])
             return data
         except (json.JSONDecodeError, OSError) as exc:
             print(f"Warning: could not read {DATA_FILE}: {exc}")
-    return {"next_ticket": 1, "open_tickets": {}}
+    return {"next_ticket": 1, "open_tickets": {}, "panel_message_ids": []}
 
 
 def save_data(data):
@@ -238,119 +243,95 @@ def is_staff(member: discord.Member) -> bool:
     return mod_role.id in role_ids or admin_role.id in role_ids
 
 
-class TicketPanel(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(
-        label="Help",
-        style=discord.ButtonStyle.primary,
-        emoji="🆘",
-        custom_id="create_ticket",
+def panel_embed() -> discord.Embed:
+    return discord.Embed(
+        title="🆘 Need Help?",
+        description=(
+            "React with 🆘 below to open a **private help ticket**.\n\n"
+            "Only you, **mods**, and **admins** can see your ticket.\n"
+            "Staff will be pinged when your ticket opens.\n\n"
+            "Click **Close Ticket** inside your ticket when you're done."
+        ),
+        color=discord.Color.green(),
     )
-    async def create_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        try:
-            await self._create_ticket(interaction)
-        except Exception:
-            traceback.print_exc()
-            message = "Something went wrong creating your ticket. Please try again."
-            if interaction.response.is_done():
-                await interaction.followup.send(message, ephemeral=True)
-            else:
-                await interaction.response.send_message(message, ephemeral=True)
 
-    async def _create_ticket(self, interaction: discord.Interaction):
-        data = load_data()
-        user_id = str(interaction.user.id)
 
-        if user_id in data["open_tickets"]:
-            channel = bot.get_channel(data["open_tickets"][user_id])
-            if channel:
-                await interaction.response.send_message(
-                    f"You already have an open ticket: {channel.mention}",
-                    ephemeral=True,
-                )
-                return
-            del data["open_tickets"][user_id]
-            save_data(data)
+async def create_ticket_for_member(
+    guild: discord.Guild,
+    member: Union[discord.Member, discord.abc.Snowflake],
+) -> Tuple[Optional[discord.TextChannel], Optional[str]]:
+    """
+    Create a private help ticket for a member.
+    Returns (channel, None) on success, or (None, error_message).
+    """
+    data = load_data()
+    user_id = str(member.id)
 
-        guild = interaction.guild
-        if guild is None:
-            await interaction.response.send_message(
-                "Tickets can only be created in a server.",
-                ephemeral=True,
-            )
-            return
-
-        category = None
-        if TICKET_CATEGORY_ID:
-            category = guild.get_channel(TICKET_CATEGORY_ID)
-            if category is not None and not isinstance(category, discord.CategoryChannel):
-                await interaction.response.send_message(
-                    "TICKET_CATEGORY_ID must be a category channel ID.",
-                    ephemeral=True,
-                )
-                return
-
-        try:
-            mod_role, admin_role = resolve_staff_roles(guild)
-        except ValueError as exc:
-            await interaction.response.send_message(
-                f"Ticket system misconfigured: {exc}. "
-                "Create roles named **mods** and **admin**, or set "
-                "MOD_ROLE_ID / ADMIN_ROLE_ID to those role IDs.",
-                ephemeral=True,
-            )
-            return
-
-        ticket_number = data["next_ticket"]
-        overwrites = build_ticket_overwrites(
-            guild, interaction.user, mod_role, admin_role
-        )
-
-        channel = await guild.create_text_channel(
-            name=f"help-{ticket_number}",
-            category=category,
-            overwrites=overwrites,
-            topic=f"Ticket for {interaction.user} | ID: {ticket_number}",
-        )
-
-        data["next_ticket"] += 1
-        data["open_tickets"][user_id] = channel.id
+    if user_id in data["open_tickets"]:
+        channel = bot.get_channel(data["open_tickets"][user_id])
+        if channel:
+            return None, f"You already have an open ticket: {channel.mention}"
+        del data["open_tickets"][user_id]
         save_data(data)
 
-        embed = discord.Embed(
-            title=f"Help Ticket #{ticket_number}",
-            description=(
-                f"Hello {interaction.user.mention}!\n\n"
-                "Please describe your issue.\n"
-                "Mods and admins will help you shortly.\n\n"
-                "Click **Close Ticket** when finished."
-            ),
-            color=discord.Color.blue(),
+    category = None
+    if TICKET_CATEGORY_ID:
+        category = guild.get_channel(TICKET_CATEGORY_ID)
+        if category is not None and not isinstance(category, discord.CategoryChannel):
+            return None, "TICKET_CATEGORY_ID must be a category channel ID."
+
+    try:
+        mod_role, admin_role = resolve_staff_roles(guild)
+    except ValueError as exc:
+        return (
+            None,
+            f"Ticket system misconfigured: {exc}. "
+            "Create roles named **mods** and **admin**.",
         )
 
-        # Always ping @mods and @admin (plus the ticket opener).
-        ping_roles = [mod_role]
-        if admin_role.id != mod_role.id:
-            ping_roles.append(admin_role)
-        mentions = [interaction.user.mention, *(role.mention for role in ping_roles)]
+    ticket_number = data["next_ticket"]
+    overwrites = build_ticket_overwrites(guild, member, mod_role, admin_role)
 
-        await channel.send(
-            content=" ".join(mentions),
-            embed=embed,
-            view=CloseTicketView(),
-            allowed_mentions=discord.AllowedMentions(
-                everyone=False,
-                users=[interaction.user],
-                roles=ping_roles,
-            ),
-        )
+    channel = await guild.create_text_channel(
+        name=f"help-{ticket_number}",
+        category=category,
+        overwrites=overwrites,
+        topic=f"Ticket for {member} | ID: {ticket_number}",
+    )
 
-        await interaction.response.send_message(
-            f"Your private ticket is ready: {channel.mention}",
-            ephemeral=True,
-        )
+    data["next_ticket"] += 1
+    data["open_tickets"][user_id] = channel.id
+    save_data(data)
+
+    mention_user = getattr(member, "mention", f"<@{member.id}>")
+    embed = discord.Embed(
+        title=f"Help Ticket #{ticket_number}",
+        description=(
+            f"Hello {mention_user}!\n\n"
+            "Please describe your issue.\n"
+            "Mods and admins will help you shortly.\n\n"
+            "Click **Close Ticket** when finished."
+        ),
+        color=discord.Color.blue(),
+    )
+
+    ping_roles = [mod_role]
+    if admin_role.id != mod_role.id:
+        ping_roles.append(admin_role)
+    mentions = [mention_user, *(role.mention for role in ping_roles)]
+
+    allowed_users = [member] if isinstance(member, discord.abc.User) else []
+    await channel.send(
+        content=" ".join(mentions),
+        embed=embed,
+        view=CloseTicketView(),
+        allowed_mentions=discord.AllowedMentions(
+            everyone=False,
+            users=allowed_users or True,
+            roles=ping_roles,
+        ),
+    )
+    return channel, None
 
 
 class CloseTicketView(discord.ui.View):
@@ -500,7 +481,6 @@ async def on_ready():
         f"mod role via {'id ' + str(MOD_ROLE_ID) if MOD_ROLE_ID else 'name mods'}; "
         f"admin role via {'id ' + str(ADMIN_ROLE_ID) if ADMIN_ROLE_ID else 'name admin'}"
     )
-    bot.add_view(TicketPanel())
     bot.add_view(CloseTicketView())
 
     try:
@@ -537,30 +517,94 @@ async def on_ready():
         print("Ticket permission repair failed; bot will keep running.")
 
 
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    """Open a ticket when someone reacts with 🆘 on a panel message."""
+    if payload.guild_id != GUILD_ID:
+        return
+    if bot.user and payload.user_id == bot.user.id:
+        return
+    if str(payload.emoji) != HELP_EMOJI:
+        return
+
+    data = load_data()
+    if payload.message_id not in data.get("panel_message_ids", []):
+        return
+
+    if payload.user_id in _creating_tickets:
+        return
+    _creating_tickets.add(payload.user_id)
+
+    try:
+        guild = bot.get_guild(payload.guild_id) or await bot.fetch_guild(payload.guild_id)
+        channel = bot.get_channel(payload.channel_id)
+        if channel is None:
+            channel = await bot.fetch_channel(payload.channel_id)
+
+        # Remove their reaction so they can click 🆘 again later if needed.
+        if isinstance(channel, discord.TextChannel):
+            try:
+                message = await channel.fetch_message(payload.message_id)
+                user = discord.Object(id=payload.user_id)
+                await message.remove_reaction(HELP_EMOJI, user)
+            except discord.HTTPException:
+                pass
+
+        member = guild.get_member(payload.user_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(payload.user_id)
+            except discord.HTTPException:
+                member = discord.Object(id=payload.user_id)
+
+        ticket_channel, error = await create_ticket_for_member(guild, member)
+        notice_channel = channel if isinstance(channel, discord.TextChannel) else None
+
+        if error:
+            if notice_channel is not None:
+                msg = await notice_channel.send(
+                    f"<@{payload.user_id}> {error}",
+                    delete_after=15,
+                )
+                # delete_after handles cleanup
+                _ = msg
+            return
+
+        if ticket_channel is not None and notice_channel is not None:
+            await notice_channel.send(
+                f"<@{payload.user_id}> Your private ticket is ready: {ticket_channel.mention}",
+                delete_after=20,
+            )
+    except Exception:
+        traceback.print_exc()
+    finally:
+        _creating_tickets.discard(payload.user_id)
+
+
 @bot.tree.command(name="setup", description="Post the private ticket Help panel", guild=guild_obj)
 @app_commands.checks.has_permissions(administrator=True)
 async def setup_cmd(interaction: discord.Interaction):
     if interaction.channel is None or not isinstance(
-        interaction.channel, (discord.TextChannel, discord.Thread)
+        interaction.channel, discord.TextChannel
     ):
         await interaction.response.send_message(
             "Run /setup in a text channel.", ephemeral=True
         )
         return
 
-    embed = discord.Embed(
-        title="🆘 Support Ticket System",
-        description=(
-            "Need help?\n\n"
-            "Click the **Help** button below to open a private ticket with the mod & admin team.\n"
-            "Only you, mods, and admins can see the ticket.\n"
-            "Tickets are named `help-1`, `help-2`, etc.\n"
-            "You or staff can close the ticket when done."
-        ),
-        color=discord.Color.green(),
+    message = await interaction.channel.send(embed=panel_embed())
+    await message.add_reaction(HELP_EMOJI)
+
+    data = load_data()
+    panel_ids = data.setdefault("panel_message_ids", [])
+    if message.id not in panel_ids:
+        panel_ids.append(message.id)
+        save_data(data)
+
+    await interaction.response.send_message(
+        f"Ticket panel posted. People can react with {HELP_EMOJI} to open a ticket.",
+        ephemeral=True,
     )
-    await interaction.channel.send(embed=embed, view=TicketPanel())
-    await interaction.response.send_message("Ticket panel posted.", ephemeral=True)
 
 
 @bot.tree.command(
