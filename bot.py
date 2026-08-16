@@ -1,35 +1,84 @@
 import asyncio
 import json
 import os
+import re
+import sys
+import traceback
 from pathlib import Path
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
+SNOWFLAKE_RE = re.compile(r"\d{15,20}")
+
+
+def parse_snowflake(raw: str, label: str) -> int:
+    """Accept raw IDs, <@&id> role mentions, <#id> channels, or Discord links."""
+    value = raw.strip().strip('"').strip("'")
+    match = SNOWFLAKE_RE.search(value)
+    if not match:
+        raise ValueError(
+            f"{label} must be a Discord ID (numbers only). Got: {raw!r}"
+        )
+    return int(match.group(0))
+
+
+def require_snowflake(label: str, *env_names: str) -> int:
+    for name in env_names:
+        raw = os.environ.get(name)
+        if raw is None or not str(raw).strip():
+            continue
+        try:
+            return parse_snowflake(str(raw), name)
+        except ValueError as exc:
+            print(f"CONFIG ERROR: {exc}", file=sys.stderr)
+            raise SystemExit(1) from exc
+    print(
+        f"CONFIG ERROR: Missing {label}. Set one of: {', '.join(env_names)}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+
 # ================== CONFIG (from Railway Variables) ==================
-TOKEN = os.environ["DISCORD_TOKEN"]
-GUILD_ID = int(os.environ["GUILD_ID"])
-PANEL_CHANNEL_ID = int(os.environ["PANEL_CHANNEL_ID"])
-TICKET_CATEGORY_ID = int(os.environ["TICKET_CATEGORY_ID"])
-# Prefer MOD_ROLE_ID; SUPPORT_ROLE_ID kept as a fallback for older env setups.
-MOD_ROLE_ID = int(os.environ.get("MOD_ROLE_ID") or os.environ["SUPPORT_ROLE_ID"])
-ADMIN_ROLE_ID = int(os.environ["ADMIN_ROLE_ID"])
+TOKEN = os.environ.get("DISCORD_TOKEN", "").strip()
+if not TOKEN:
+    print("CONFIG ERROR: DISCORD_TOKEN is missing.", file=sys.stderr)
+    raise SystemExit(1)
+
+GUILD_ID = require_snowflake("GUILD_ID", "GUILD_ID")
+PANEL_CHANNEL_ID = require_snowflake("PANEL_CHANNEL_ID", "PANEL_CHANNEL_ID")
+TICKET_CATEGORY_ID = require_snowflake("TICKET_CATEGORY_ID", "TICKET_CATEGORY_ID")
+MOD_ROLE_ID = require_snowflake(
+    "mod role id", "MOD_ROLE_ID", "SUPPORT_ROLE_ID", "MODS_ROLE_ID"
+)
+ADMIN_ROLE_ID = require_snowflake(
+    "admin role id", "ADMIN_ROLE_ID", "ADMINISTRATOR_ROLE_ID"
+)
 # =====================================================================
 
+# No privileged intents — avoids Discord PrivilegedIntentsRequired crash-loops
+# when Message Content / Server Members are disabled in the developer portal.
 intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
 intents.guilds = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+guild_obj = discord.Object(id=GUILD_ID)
 
 DATA_FILE = Path("tickets.json")
 
 
 def load_data():
     if DATA_FILE.exists():
-        with open(DATA_FILE, "r") as f:
-            return json.load(f)
+        try:
+            with open(DATA_FILE, "r") as f:
+                data = json.load(f)
+            data.setdefault("next_ticket", 1)
+            data.setdefault("open_tickets", {})
+            return data
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"Warning: could not read {DATA_FILE}: {exc}")
     return {"next_ticket": 1, "open_tickets": {}}
 
 
@@ -45,19 +94,28 @@ def resolve_staff_roles(guild: discord.Guild):
 
     problems = []
     if mod_role is None:
-        problems.append(f"MOD/SUPPORT role id {MOD_ROLE_ID} not found")
+        problems.append(f"mod role id {MOD_ROLE_ID} not found in this server")
     elif mod_role.is_default():
-        problems.append("MOD/SUPPORT role is @everyone — that would open tickets to everyone")
+        problems.append("mod role is @everyone — that would open tickets to everyone")
 
     if admin_role is None:
-        problems.append(f"ADMIN role id {ADMIN_ROLE_ID} not found")
+        problems.append(f"admin role id {ADMIN_ROLE_ID} not found in this server")
     elif admin_role.is_default():
-        problems.append("ADMIN role is @everyone — that would open tickets to everyone")
+        problems.append("admin role is @everyone — that would open tickets to everyone")
 
     if problems:
         raise ValueError("; ".join(problems))
 
     return mod_role, admin_role
+
+
+def bot_member(guild: discord.Guild) -> discord.abc.Snowflake:
+    me = guild.me
+    if me is not None:
+        return me
+    if bot.user is not None:
+        return discord.Object(id=bot.user.id)
+    raise RuntimeError("Bot user is not available yet")
 
 
 def build_ticket_overwrites(
@@ -73,9 +131,6 @@ def build_ticket_overwrites(
     - mod role: can see + send
     - admin role: can see + send + manage channel
     - bot: can see + send + manage channel
-
-    Roles are applied one target at a time so a wrong shared id cannot wipe the
-    @everyone deny (dict key collision).
     """
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(
@@ -90,7 +145,7 @@ def build_ticket_overwrites(
             attach_files=True,
             embed_links=True,
         ),
-        guild.me: discord.PermissionOverwrite(
+        bot_member(guild): discord.PermissionOverwrite(
             view_channel=True,
             send_messages=True,
             read_message_history=True,
@@ -116,7 +171,6 @@ def build_ticket_overwrites(
         manage_messages=True,
     )
 
-    # Never grant staff access via @everyone; that misconfig opens tickets to all.
     if mod_role.id != guild.default_role.id and mod_role not in overwrites:
         overwrites[mod_role] = mod_perms
 
@@ -145,6 +199,17 @@ class TicketPanel(discord.ui.View):
         custom_id="create_ticket",
     )
     async def create_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await self._create_ticket(interaction)
+        except Exception:
+            traceback.print_exc()
+            message = "Something went wrong creating your ticket. Please try again."
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+
+    async def _create_ticket(self, interaction: discord.Interaction):
         data = load_data()
         user_id = str(interaction.user.id)
 
@@ -168,6 +233,13 @@ class TicketPanel(discord.ui.View):
             return
 
         category = guild.get_channel(TICKET_CATEGORY_ID)
+        if category is not None and not isinstance(category, discord.CategoryChannel):
+            await interaction.response.send_message(
+                "TICKET_CATEGORY_ID must be a category channel ID.",
+                ephemeral=True,
+            )
+            return
+
         try:
             mod_role, admin_role = resolve_staff_roles(guild)
         except ValueError as exc:
@@ -233,6 +305,17 @@ class CloseTicketView(discord.ui.View):
         custom_id="close_ticket",
     )
     async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await self._close_ticket(interaction)
+        except Exception:
+            traceback.print_exc()
+            message = "Something went wrong closing this ticket."
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+
+    async def _close_ticket(self, interaction: discord.Interaction):
         data = load_data()
         channel = interaction.channel
         user_id = None
@@ -265,7 +348,8 @@ class CloseTicketView(discord.ui.View):
             del data["open_tickets"][user_id]
             save_data(data)
 
-        await channel.delete(reason=f"Closed by {interaction.user}")
+        if isinstance(channel, discord.TextChannel):
+            await channel.delete(reason=f"Closed by {interaction.user}")
 
 
 async def repair_open_ticket_permissions(guild: discord.Guild) -> int:
@@ -288,13 +372,13 @@ async def repair_open_ticket_permissions(guild: discord.Guild) -> int:
         if not isinstance(channel, discord.TextChannel):
             continue
 
-        opener = guild.get_member(int(user_id))
-        opener_target = opener or discord.Object(id=int(user_id))
-        overwrites = build_ticket_overwrites(
-            guild, opener_target, mod_role, admin_role
-        )
-        await channel.edit(overwrites=overwrites, reason="Repair private ticket access")
-        fixed += 1
+        opener = guild.get_member(int(user_id)) or discord.Object(id=int(user_id))
+        overwrites = build_ticket_overwrites(guild, opener, mod_role, admin_role)
+        try:
+            await channel.edit(overwrites=overwrites, reason="Repair private ticket access")
+            fixed += 1
+        except discord.HTTPException as exc:
+            print(f"Could not repair #{channel.name}: {exc}")
 
     for user_id in stale:
         del data["open_tickets"][user_id]
@@ -306,33 +390,47 @@ async def repair_open_ticket_permissions(guild: discord.Guild) -> int:
 
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user}")
+    print(f"Logged in as {bot.user} ({bot.user.id if bot.user else '?'})")
+    print(
+        f"Using GUILD_ID={GUILD_ID} MOD_ROLE_ID={MOD_ROLE_ID} ADMIN_ROLE_ID={ADMIN_ROLE_ID}"
+    )
     bot.add_view(TicketPanel())
     bot.add_view(CloseTicketView())
 
+    try:
+        synced = await bot.tree.sync(guild=guild_obj)
+        print(f"Synced {len(synced)} slash command(s) to guild {GUILD_ID}")
+    except Exception:
+        traceback.print_exc()
+        print("Slash command sync failed; bot will keep running.")
+
     guild = bot.get_guild(GUILD_ID)
     if guild is None:
-        print(f"Warning: guild {GUILD_ID} not found; cannot repair tickets yet.")
+        print(
+            f"Warning: guild {GUILD_ID} not in cache yet. "
+            "Check GUILD_ID and that the bot is in that server."
+        )
         return
 
     try:
         resolve_staff_roles(guild)
-        print(
-            f"Staff access locked to mod role {MOD_ROLE_ID} and admin role {ADMIN_ROLE_ID} "
-            "(plus ticket opener)."
-        )
+        print("Staff access locked to mod + admin roles (plus ticket opener).")
     except ValueError as exc:
         print(f"CONFIG ERROR: {exc}")
         return
 
-    fixed = await repair_open_ticket_permissions(guild)
-    if fixed:
-        print(f"Repaired permissions on {fixed} open ticket channel(s).")
+    try:
+        fixed = await repair_open_ticket_permissions(guild)
+        if fixed:
+            print(f"Repaired permissions on {fixed} open ticket channel(s).")
+    except Exception:
+        traceback.print_exc()
+        print("Ticket permission repair failed; bot will keep running.")
 
 
-@bot.command(name="setup")
-@commands.has_permissions(administrator=True)
-async def setup(ctx):
+@bot.tree.command(name="setup", description="Post the private ticket Help panel", guild=guild_obj)
+@app_commands.checks.has_permissions(administrator=True)
+async def setup_cmd(interaction: discord.Interaction):
     embed = discord.Embed(
         title="🆘 Support Ticket System",
         description=(
@@ -344,20 +442,61 @@ async def setup(ctx):
         ),
         color=discord.Color.green(),
     )
-    await ctx.send(embed=embed, view=TicketPanel())
-    await ctx.message.delete()
+    await interaction.channel.send(embed=embed, view=TicketPanel())
+    await interaction.response.send_message("Ticket panel posted.", ephemeral=True)
 
 
-@bot.command(name="fixticks")
-@commands.has_permissions(administrator=True)
-async def fixticks(ctx):
-    """Re-lock open tickets so only opener + mod + admin can access them."""
-    fixed = await repair_open_ticket_permissions(ctx.guild)
-    await ctx.send(
+@bot.tree.command(
+    name="fixticks",
+    description="Re-lock open tickets to opener + mods + admins only",
+    guild=guild_obj,
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def fixticks_cmd(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "Run this inside the server.", ephemeral=True
+        )
+        return
+    await interaction.response.defer(ephemeral=True)
+    fixed = await repair_open_ticket_permissions(interaction.guild)
+    await interaction.followup.send(
         f"Repaired **{fixed}** open ticket(s). "
         "Only the sender, mods, and admins can view them now.",
-        delete_after=15,
+        ephemeral=True,
     )
 
 
-bot.run(TOKEN)
+@setup_cmd.error
+@fixticks_cmd.error
+async def staff_cmd_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        message = "Admin permission required."
+    else:
+        traceback.print_exc()
+        message = "Command failed."
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
+
+
+def main():
+    print("Starting support ticket bot…")
+    try:
+        bot.run(TOKEN, reconnect=True)
+    except discord.errors.PrivilegedIntentsRequired:
+        print(
+            "CONFIG ERROR: Discord rejected privileged intents.\n"
+            "This bot no longer needs Message Content or Server Members intents.\n"
+            "Turn those OFF in code is already done — if you still see this, check the portal.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    except discord.LoginFailure:
+        print("CONFIG ERROR: DISCORD_TOKEN is invalid.", file=sys.stderr)
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()
