@@ -41,6 +41,19 @@ def require_snowflake(label: str, *env_names: str) -> int:
     raise SystemExit(1)
 
 
+def optional_snowflake(*env_names: str) -> int | None:
+    for name in env_names:
+        raw = os.environ.get(name)
+        if raw is None or not str(raw).strip():
+            continue
+        try:
+            return parse_snowflake(str(raw), name)
+        except ValueError as exc:
+            print(f"CONFIG ERROR: {exc}", file=sys.stderr)
+            raise SystemExit(1) from exc
+    return None
+
+
 # ================== CONFIG (from Railway Variables) ==================
 TOKEN = os.environ.get("DISCORD_TOKEN", "").strip()
 if not TOKEN:
@@ -50,12 +63,11 @@ if not TOKEN:
 GUILD_ID = require_snowflake("GUILD_ID", "GUILD_ID")
 PANEL_CHANNEL_ID = require_snowflake("PANEL_CHANNEL_ID", "PANEL_CHANNEL_ID")
 TICKET_CATEGORY_ID = require_snowflake("TICKET_CATEGORY_ID", "TICKET_CATEGORY_ID")
-MOD_ROLE_ID = require_snowflake(
-    "mod role id", "MOD_ROLE_ID", "SUPPORT_ROLE_ID", "MODS_ROLE_ID"
-)
-ADMIN_ROLE_ID = require_snowflake(
-    "admin role id", "ADMIN_ROLE_ID", "ADMINISTRATOR_ROLE_ID"
-)
+# Optional overrides — by default the bot finds roles named "mods" and "admin".
+MOD_ROLE_ID = optional_snowflake("MOD_ROLE_ID", "SUPPORT_ROLE_ID", "MODS_ROLE_ID")
+ADMIN_ROLE_ID = optional_snowflake("ADMIN_ROLE_ID", "ADMINISTRATOR_ROLE_ID")
+MOD_ROLE_NAMES = ("mods", "mod")
+ADMIN_ROLE_NAMES = ("admin", "admins")
 # =====================================================================
 
 # No privileged intents — avoids Discord PrivilegedIntentsRequired crash-loops
@@ -63,7 +75,14 @@ ADMIN_ROLE_ID = require_snowflake(
 intents = discord.Intents.default()
 intents.guilds = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents,
+    # Role pings for @mods / @admin must be explicitly allowed.
+    allowed_mentions=discord.AllowedMentions(
+        everyone=False, users=True, roles=True, replied_user=False
+    ),
+)
 guild_obj = discord.Object(id=GUILD_ID)
 
 DATA_FILE = Path("tickets.json")
@@ -87,19 +106,41 @@ def save_data(data):
         json.dump(data, f, indent=4)
 
 
+def find_role_by_names(guild: discord.Guild, names: tuple[str, ...]) -> discord.Role | None:
+    wanted = {name.casefold() for name in names}
+    for role in guild.roles:
+        if role.is_default():
+            continue
+        if role.name.casefold() in wanted:
+            return role
+    return None
+
+
 def resolve_staff_roles(guild: discord.Guild):
-    """Resolve mod/admin roles and refuse @everyone / missing IDs (common misconfig)."""
-    mod_role = guild.get_role(MOD_ROLE_ID)
-    admin_role = guild.get_role(ADMIN_ROLE_ID)
+    """
+    Resolve the @mods and @admin roles.
+    Prefers optional env IDs when set; otherwise looks up roles by name.
+    """
+    mod_role = guild.get_role(MOD_ROLE_ID) if MOD_ROLE_ID else None
+    admin_role = guild.get_role(ADMIN_ROLE_ID) if ADMIN_ROLE_ID else None
+
+    if mod_role is None:
+        mod_role = find_role_by_names(guild, MOD_ROLE_NAMES)
+    if admin_role is None:
+        admin_role = find_role_by_names(guild, ADMIN_ROLE_NAMES)
 
     problems = []
     if mod_role is None:
-        problems.append(f"mod role id {MOD_ROLE_ID} not found in this server")
+        problems.append(
+            'could not find a role named "mods" (or set MOD_ROLE_ID / SUPPORT_ROLE_ID)'
+        )
     elif mod_role.is_default():
         problems.append("mod role is @everyone — that would open tickets to everyone")
 
     if admin_role is None:
-        problems.append(f"admin role id {ADMIN_ROLE_ID} not found in this server")
+        problems.append(
+            'could not find a role named "admin" (or set ADMIN_ROLE_ID)'
+        )
     elif admin_role.is_default():
         problems.append("admin role is @everyone — that would open tickets to everyone")
 
@@ -184,8 +225,12 @@ def build_ticket_overwrites(
 def is_staff(member: discord.Member) -> bool:
     if member.guild_permissions.administrator:
         return True
+    try:
+        mod_role, admin_role = resolve_staff_roles(member.guild)
+    except ValueError:
+        return False
     role_ids = {role.id for role in member.roles}
-    return MOD_ROLE_ID in role_ids or ADMIN_ROLE_ID in role_ids
+    return mod_role.id in role_ids or admin_role.id in role_ids
 
 
 class TicketPanel(discord.ui.View):
@@ -245,8 +290,8 @@ class TicketPanel(discord.ui.View):
         except ValueError as exc:
             await interaction.response.send_message(
                 f"Ticket system misconfigured: {exc}. "
-                "An admin must set MOD_ROLE_ID (or SUPPORT_ROLE_ID) and ADMIN_ROLE_ID "
-                "to real mod/admin role IDs — not @everyone.",
+                "Create roles named **mods** and **admin**, or set "
+                "MOD_ROLE_ID / ADMIN_ROLE_ID to those role IDs.",
                 ephemeral=True,
             )
             return
@@ -278,14 +323,21 @@ class TicketPanel(discord.ui.View):
             color=discord.Color.blue(),
         )
 
-        mentions = [interaction.user.mention, mod_role.mention]
+        # Always ping @mods and @admin (plus the ticket opener).
+        ping_roles = [mod_role]
         if admin_role.id != mod_role.id:
-            mentions.append(admin_role.mention)
+            ping_roles.append(admin_role)
+        mentions = [interaction.user.mention, *(role.mention for role in ping_roles)]
 
         await channel.send(
             content=" ".join(mentions),
             embed=embed,
             view=CloseTicketView(),
+            allowed_mentions=discord.AllowedMentions(
+                everyone=False,
+                users=[interaction.user],
+                roles=ping_roles,
+            ),
         )
 
         await interaction.response.send_message(
@@ -392,7 +444,9 @@ async def repair_open_ticket_permissions(guild: discord.Guild) -> int:
 async def on_ready():
     print(f"Logged in as {bot.user} ({bot.user.id if bot.user else '?'})")
     print(
-        f"Using GUILD_ID={GUILD_ID} MOD_ROLE_ID={MOD_ROLE_ID} ADMIN_ROLE_ID={ADMIN_ROLE_ID}"
+        f"Using GUILD_ID={GUILD_ID}; "
+        f"mod role via {'id ' + str(MOD_ROLE_ID) if MOD_ROLE_ID else 'name mods'}; "
+        f"admin role via {'id ' + str(ADMIN_ROLE_ID) if ADMIN_ROLE_ID else 'name admin'}"
     )
     bot.add_view(TicketPanel())
     bot.add_view(CloseTicketView())
